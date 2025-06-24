@@ -20,6 +20,7 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import math
+import copy
 
 from PIL import Image
 import numpy as np
@@ -621,14 +622,15 @@ class OmniGen2Pipeline(DiffusionPipeline):
     ):
         batch_size = latents.shape[0]
 
+        scheduler = copy.deepcopy(self.scheduler)
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
+            scheduler,
             num_inference_steps,
             device,
             timesteps,
             num_tokens=latents.shape[-2] * latents.shape[-1]
         )
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * scheduler.order, 0)
         self._num_timesteps = len(timesteps)
         
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -679,11 +681,11 @@ class OmniGen2Pipeline(DiffusionPipeline):
                     )
                     model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
 
-                latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
 
                 latents = latents.to(dtype=dtype)
 
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % scheduler.order == 0):
                     progress_bar.update()
                 
                 if step_func is not None:
