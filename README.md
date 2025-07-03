@@ -24,8 +24,10 @@
 </h4>
 
 ## 🔥 News
+- **2025-07-03**: OmniGen2 now supports [teacache](https://github.com/ali-vilab/TeaCache) for faster inference, thanks @legitnull for great [PR](https://github.com/VectorSpaceLab/OmniGen2/pull/52).
+- **2025-07-01**: OmniGen2 is supported by [ComfyUI official](https://comfyanonymous.github.io/ComfyUI_examples/omnigen), thanks !!
 - **2025-06-30**: Training code is available, see [fine-tuning](docs/FINETUNE.md) for details.
-- **2025-06-28**: We release [OmniContext](https://huggingface.co/datasets/OmniGen2/OmniContext) benchmark. The evaluation code can be found in [omnicontext](https://github.com/VectorSpaceLab/OmniGen2/tree/main/omnicontext).
+- **2025-06-28**: We release [OmniContext](https://huggingface.co/datasets/OmniGen2/OmniContext) benchmark. The evaluation codes are in [omnicontext](https://github.com/VectorSpaceLab/OmniGen2/tree/main/omnicontext).
 - **2025-06-24**: [Technical Report](https://arxiv.org/abs/2506.18871) is available.
 - **2025-06-23**: We’ve updated our code and HF model—OmniGen2 now runs *without* `flash-attn`. Users can still install it for optimal performance.
 - **2025-06-20**: Updated [resource requirements](#-resources-requirement), adding CPU offload support for devices with limited VRAM.
@@ -180,6 +182,8 @@ To achieve optimal results with OmniGen2, you can adjust the following key hyper
 - `cfg_range_start`, `cfg_range_end`: Define the timestep range where CFG is applied. Per this [paper](https://arxiv.org/abs/2404.07724), reducing `cfg_range_end` can significantly decrease inference time with a negligible impact on quality.
 - `scheduler`: Choose between `[euler, dpmsolver++]`. Default is `euler`. For potentially better performance with fewer steps, try `dpmsolver++`.
 - `num_inference_step`: Number of discretization steps for the ODE solver. Default is `50`.
+- `enable_teacache`: whether or not enable [teacache](https://github.com/ali-vilab/TeaCache) for faster inference.
+- `rel_l1_thresh`: TBD.
 
 **Some suggestions for improving generation quality:**
 1. Use High-Quality Images
