@@ -8,6 +8,8 @@ import os
 import argparse
 import random
 from datetime import datetime
+import numpy as np
+from PIL import Image
 
 import torch
 from torchvision.transforms.functional import to_pil_image, to_tensor
@@ -76,12 +78,15 @@ def run(
     if seed_input == -1:
         seed_input = random.randint(0, 2**16 - 1)
 
-    generator = torch.Generator(device=accelerator.device).manual_seed(seed_input)
+    generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed_input)
 
     def progress_callback(cur_step, timesteps):
         frac = (cur_step + 1) / float(timesteps)
         progress(frac)
 
+    if not pipeline:
+        raise ValueError(
+            "Pipeline is not initialized. Please call `load_pipeline` before running.",__name__)
     if scheduler == 'euler':
         pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
     elif scheduler == 'dpmsolver++':
@@ -113,7 +118,16 @@ def run(
 
     progress(1.0)
 
-    vis_images = [to_tensor(image) * 2 - 1 for image in results.images]
+    # Check if results has an 'images' attribute, otherwise treat it as a single image
+    vis_images = None
+    if hasattr(results, 'images'):
+        vis_images = [to_tensor(image) * 2 - 1 for image in results.images]  # type: ignore[attr-defined]
+    elif isinstance(results, (Image.Image, np.ndarray)):
+        # Assume it's a single image
+        vis_images = [to_tensor(results) * 2 - 1]
+    else:
+        # Unhandled type, raise an error
+        raise TypeError(f"Unsupported result type: {type(results)}")
     output_image = create_collage(vis_images)
 
     if save_images:
@@ -537,7 +551,7 @@ def get_example():
             1024 * 1024,
             0,
         ],
-        
+
 
 
         [
@@ -996,13 +1010,13 @@ def main(args):
                         value=1.0,
                         step=0.1,
                     )
-                
+
                 def adjust_end_slider(start_val, end_val):
                     return max(start_val, end_val)
 
                 def adjust_start_slider(end_val, start_val):
                     return min(end_val, start_val)
-                
+
                 cfg_range_start.input(
                     fn=adjust_end_slider,
                     inputs=[cfg_range_start, cfg_range_end],

@@ -3,14 +3,23 @@ import dotenv
 dotenv.load_dotenv(override=True)
 
 import gradio as gr
+# PIL dependency for version-safe resampling
+from PIL import Image
+if hasattr(Image, 'Resampling'):
+    LANCZOS = Image.Resampling.LANCZOS
+elif hasattr(Image, 'LANCZOS'):
+    LANCZOS = Image.LANCZOS # type: ignore[attr-defined]
+from gradio import Image
 
-import os
+import os, sys
 import argparse
 import random
 from datetime import datetime
 
 import torch
 from torchvision.transforms.functional import to_pil_image, to_tensor
+
+import numpy as np
 
 from accelerate import Accelerator
 
@@ -20,6 +29,15 @@ from omnigen2.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEu
 from omnigen2.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from omnigen2.utils.img_util import create_collage
 
+from loguru import logger
+logger.configure(
+    handlers=[{
+        "sink": sys.stdout,
+        "level": "INFO",
+        "format": "{time:YYYY-MM-DD at HH:mm:ss} | {level} | {message}",
+    }],
+)
+
 NEGATIVE_PROMPT = "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,25 +45,46 @@ pipeline = None
 accelerator = None
 save_images = False
 
-
-def load_pipeline(accelerator, weight_dtype, args):
+def load_pipeline(_accelerator, weight_dtype, args):
+    global pipeline, accelerator, save_images
+    accelerator = _accelerator
     pipeline = OmniGen2ChatPipeline.from_pretrained(
         args.model_path,
         torch_dtype=weight_dtype,
         trust_remote_code=True,
     )
-    pipeline.transformer = OmniGen2Transformer2DModel.from_pretrained(
+    # Load and compile transformer model
+    transformer = OmniGen2Transformer2DModel.from_pretrained(
         args.model_path,
         subfolder="transformer",
         torch_dtype=weight_dtype,
     )
+    pipeline.transformer = torch.compile(transformer)
+
+    # Handle device placement with offload checks
     if args.enable_sequential_cpu_offload:
         pipeline.enable_sequential_cpu_offload()
     elif args.enable_model_cpu_offload:
         pipeline.enable_model_cpu_offload()
     else:
         pipeline = pipeline.to(accelerator.device)
-    return pipeline
+
+    # Optimize model parameters after device placement
+    pipeline.scheduler.zero_grad()
+    pipeline.scheduler.step()
+
+    return torch.compile(pipeline)
+
+# Temporary type validation pause for testing optimization
+def _safe_convert_to_image(image):
+    try:
+        if isinstance(image, torch.Tensor):
+            return to_pil_image(image)
+        elif isinstance(image, (Image, np.ndarray)):
+            return Image(image) # type: ignore
+    except Exception as e:
+        print(f"Image conversion failed: {e}")
+        return None
 
 def run(
     instruction,
@@ -66,31 +105,86 @@ def run(
     max_pixels,
     seed_input,
     progress=gr.Progress(),
+    output_dir=os.path.join(ROOT_DIR, 'outputs_gradio'),
 ):
     input_images = [image_input_1, image_input_2, image_input_3]
     input_images = [img for img in input_images if img is not None]
     if len(input_images) == 0:
         input_images = None
 
-    if seed_input == -1:
-        seed_input = random.randint(0, 2**16 - 1)
+    global pipeline, accelerator, save_images
+
+    # Validate width and height inputs
+    if seed_input == -1 or not isinstance(seed_input, int):
+        seed_input = random.randint(0, 2**32-1)  # Ensure seed is positive and integer
+
+    # Check if the model is loaded and device is available
+    if pipeline is None:
+        # raise ValueError("Pipeline model is not initialized.")
+        logger.info("Pipeline model is not initialized, loading pipeline...    ")
+        try:
+            pipeline = load_pipeline(accelerator, torch.bfloat16, args=None)
+        except Exception as e:
+            logger.error(f"Failed to load pipeline: {e}")
+            raise e
+    if accelerator is None or not hasattr(accelerator, 'device'):
+        raise ValueError("Accelerator is None or device undefined")
+
+    # Create the generator only after validity is confirmed
     generator = torch.Generator(device=accelerator.device).manual_seed(seed_input)
 
     def progress_callback(cur_step, timesteps):
         frac = (cur_step + 1) / float(timesteps)
         progress(frac)
 
-    if scheduler == 'euler':
-        pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
-    elif scheduler == 'dpmsolver++':
-        pipeline.scheduler = DPMSolverMultistepScheduler(
-            algorithm_type="dpmsolver++",
-            solver_type="midpoint",
-            solver_order=2,
-            prediction_type="flow_prediction",
+    # Safely check pipeline and attribute before setting scheduler
+    if pipeline and hasattr(pipeline, 'scheduler'):
+        pipeline_scheduler = None
+        if scheduler == 'euler':
+            pipeline_scheduler = FlowMatchEulerDiscreteScheduler()
+        elif scheduler == 'dpmsolver++':
+            pipeline_scheduler = DPMSolverMultistepScheduler(
+                algorithm_type="dpmsolver++",
+                solver_type="midpoint",
+                solver_order=2,
+                prediction_type="flow_prediction",
+            )
+        pipeline.scheduler = pipeline_scheduler
+
+    try:
+        results = pipeline(
+            prompt=instruction,
+            input_images=input_images,
+            width=width_input,
+            height=height_input,
+            max_input_image_side_length=max_input_image_side_length,
+            max_pixels=max_pixels,
+            num_inference_steps=num_inference_steps,
+            max_sequence_length=1024,
+            text_guidance_scale=guidance_scale_input,
+            image_guidance_scale=img_guidance_scale_input,
+            cfg_range=(cfg_range_start, cfg_range_end),
+            negative_prompt=negative_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            output_type="pil",
+            step_func=progress_callback,
         )
-        
-    results = pipeline(
+    except Exception as e:
+        print(f"Error executing pipeline: {e}")
+        return None, None
+
+    # Fixed conditional handling - all tuples treated as 2-element
+    if isinstance(results, tuple) and len(results) >= 2:
+        # Safely handle known tuple structure (text,images)
+        txt_output = results[0] if results[0].startswith("<|img|>") else None
+        img_collection = results[1] if isinstance(results[1], (list, tuple)) else []
+
+    # Safe fallback for non-tuple/missing elements
+    else:
+        # Defaults in case of unexpected structure
+        txt_output = None
+        img_collection = results if isinstance(results, (list, tuple)) else [results]
         prompt=instruction,
         input_images=input_images,
         width=width_input,
@@ -107,12 +201,11 @@ def run(
         generator=generator,
         output_type="pil",
         step_func=progress_callback,
-    )
 
     progress(1.0)
 
-    if results.text.startswith("<|img|>"):
-        vis_images = [to_tensor(image) * 2 - 1 for image in results.images]
+    if isinstance(results, tuple) and isinstance(results[0], str) and results[0].startswith("<|img|>"):
+        vis_images = [to_tensor(image) * 2 - 1 for image in img_collection]
         output_image = create_collage(vis_images)
 
         if save_images:
@@ -129,14 +222,45 @@ def run(
             output_image.save(output_path)
 
             # Save All Generated Images
-            if len(results.images) > 1:
-                for i, image in enumerate(results.images):
+            if len(results[1]) > 1:
+                for i, image in enumerate(results[1]):
                     image_name, ext = os.path.splitext(output_path)
                     image.save(f"{image_name}_{i}{ext}")
 
-        return output_image, None
-    else:
-        return None, results.text
+        if save_images:
+            output_dir = os.path.join(ROOT_DIR, "outputs_gradio")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            if isinstance(results, tuple) and len(results) > 1:
+                image_collection, text_output = results
+
+                if save_images:
+                    os.makedirs(output_dir, exist_ok=True)
+
+                    if len(image_collection) <= 1:
+                        output_image_path = os.path.join(output_dir, f"{timestamp}.png")
+                        image_collection[0].save(output_image_path)
+                    else:
+                        for i, image in enumerate(image_collection):
+                            output_file_path = os.path.join(output_dir, f"{timestamp}_gen_{i+1}.png")
+                            image.save(output_file_path)
+
+                # Handle text response first
+                if isinstance(text_output, str) and text_output.startswith("<|img|>"):
+                    vis_images = [image.resize((77, 77), Image.LANCZOS) for image in image_collection]
+                    output_image_grid = create_collage(vis_images, ncols=int(len(vis_images) ** 0.5))
+                    output_image_grid.save(os.path.join(output_dir, f"{timestamp}_collage.png"))
+                    return output_image_grid, None
+
+                return None, text_output
+            elif isinstance(results, list):
+                if save_images:
+                    for i, image in enumerate(results):
+                        image.save(os.path.join(output_dir, f"{timestamp}_img_{i+1}.png"))
+
+                return None, results
+            else:
+                return None, None
 
 
 def get_example():
@@ -558,7 +682,7 @@ def get_example():
             1024 * 1024,
             0,
         ],
-        
+
 
 
         [
@@ -1018,13 +1142,13 @@ def main(args):
                         value=1.0,
                         step=0.1,
                     )
-                
+
                 def adjust_end_slider(start_val, end_val):
                     return max(start_val, end_val)
 
                 def adjust_start_slider(end_val, start_val):
                     return min(end_val, start_val)
-                
+
                 cfg_range_start.input(
                     fn=adjust_end_slider,
                     inputs=[cfg_range_start, cfg_range_end],

@@ -690,7 +690,7 @@ def _layer_norm_bwd(
         else None
     )
     _dw1 = torch.empty_like(_dw) if weight1 is not None else None
-    _db1 = torch.empty_like(_db) if bias1 is not None else None
+    _db1 = torch.empty_like(_db) if bias1 is not None else None # type: ignore[assignment]
     rows_per_program = math.ceil(M / sm_count)
     grid = (sm_count,)
     with torch.cuda.device(x.device.index):
@@ -715,7 +715,7 @@ def _layer_norm_bwd(
             mean,
             rstd,
             x.stride(0),
-            0 if not recompute_output else y.stride(0),
+            0 if not recompute_output else y.stride(0) if y else 0,
             dy.stride(0),
             dx.stride(0),
             dresidual.stride(0) if dresidual is not None else 0,
@@ -738,7 +738,7 @@ def _layer_norm_bwd(
     dw = _dw.sum(0).to(weight.dtype)
     db = _db.sum(0).to(bias.dtype) if bias is not None else None
     dw1 = _dw1.sum(0).to(weight1.dtype) if weight1 is not None else None
-    db1 = _db1.sum(0).to(bias1.dtype) if bias1 is not None else None
+    db1 = _db1.sum(0).to(bias1.dtype) if bias1 is not None else None # type: ignore[assignment]
     # Don't need to compute dresidual_in separately in this case
     if has_residual and dx.dtype == x.dtype and dropout_p == 0.0 and rowscale is None:
         dresidual_in = dx
@@ -806,12 +806,12 @@ class LayerNormFn(torch.autograd.Function):
             # Handle output tensors with correct dtype
             y = x  # Preserve input tensor properties
             y1 = torch.empty_like(x) if x1 is not None else None
-            
+
             # Only create residual_out if prenorm is True
-            residual_out = torch.empty(x.shape, 
+            residual_out = torch.empty(x.shape,
                                     dtype=torch.float32 if residual_in_fp32 else x.dtype,
                                     device=x.device) if prenorm else None
-            
+
             # Handle dropout masks
             dropout_mask = None
             dropout_mask1 = None
@@ -828,13 +828,13 @@ class LayerNormFn(torch.autograd.Function):
                     return (y, y1) if not prenorm else (y, y1, residual_out)
             else:
                 if weight1 is None:
-                    return ((y, dropout_mask, dropout_mask1) if not prenorm 
+                    return ((y, dropout_mask, dropout_mask1) if not prenorm
                         else (y, residual_out, dropout_mask, dropout_mask1))
                 else:
-                    return ((y, y1, dropout_mask, dropout_mask1) if not prenorm 
+                    return ((y, y1, dropout_mask, dropout_mask1) if not prenorm
                         else (y, y1, residual_out, dropout_mask, dropout_mask1))
 
-        ctx.zero_seq_length = False  
+        ctx.zero_seq_length = False
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-1])
         if x.stride(-1) != 1:
@@ -944,7 +944,7 @@ class LayerNormFn(torch.autograd.Function):
                 None,
                 None,
             )
-        
+
         x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
         if dy.stride(-1) != 1:
@@ -966,7 +966,7 @@ class LayerNormFn(torch.autograd.Function):
             assert dresidual.shape == x.shape
         else:
             dresidual = None
-        
+
         dx, dw, db, dresidual_in, dx1, dw1, db1 = _layer_norm_bwd(
             dy,
             x,
